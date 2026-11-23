@@ -1,6 +1,6 @@
 (function () {
     "use strict";
-    // 메세지청소 — Endcord Mobile 커뮤니티 플러그인 (Vendetta/Revenge 형식)
+    // 메세지청소 v1.0.1 — Endcord Mobile 커뮤니티 플러그인 (Vendetta/Revenge 형식)
     // 주의: 이 파일의 맨 첫 글자는 반드시 "(" 여야 합니다. 위에 빈 줄이나 주석을 넣으면 플러그인이 로드되지 않아요.
 
     /* ===== 설정 (원하면 숫자만 바꾸세요) ===== */
@@ -10,17 +10,47 @@
     var SCAN_LIMIT = 5000;      // 내 메시지를 찾으려고 거슬러 올라갈 최대 메시지 수
     var SKIP_PINNED = true;     // 고정(핀)된 메시지는 건너뛰기
     var STOP_AFTER_FAILS = 5;   // 연속으로 이만큼 실패하면 멈춤 (권한 없음 등)
+    var NET_RETRIES = 3;        // 네트워크 오류일 때 다시 시도할 횟수
 
     var metro = vendetta.metro;
     var unregisters = [];
     var job = null; // 진행 중인 청소 작업
+    var httpCache = null;
 
     function sleep(ms) {
         return new Promise(function (resolve) { setTimeout(resolve, ms); });
     }
 
-    function getRest() {
-        return metro.findByProps("getAPIBaseURL", "get") || metro.findByProps("get", "post", "del", "patch");
+    // 디스코드의 API 요청 모듈인지 확인: { get, post, put, patch, del } 함수를 가진 "객체"여야 해요.
+    // (v1.0.0은 여기서 superagent라는 저수준 라이브러리를 잘못 잡아서 "Request has been terminated" 오류가 났어요)
+    function looksLikeHttp(m) {
+        try {
+            return !!m && typeof m === "object" &&
+                typeof m.get === "function" && typeof m.post === "function" &&
+                typeof m.put === "function" && typeof m.patch === "function" &&
+                typeof m.del === "function";
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function findHttp() {
+        if (httpCache) return httpCache;
+        var candidates = [
+            function () { return metro.findByProps("getAPIBaseURL", "get"); },
+            function () { var m = metro.findByProps("HTTP"); return m && m.HTTP; },
+            function () { return metro.find(looksLikeHttp); },
+            function () { var m = metro.find(function (x) { return x && looksLikeHttp(x.HTTP); }); return m && m.HTTP; }
+        ];
+        for (var i = 0; i < candidates.length; i++) {
+            var found = null;
+            try { found = candidates[i](); } catch (e) { found = null; }
+            if (looksLikeHttp(found)) {
+                httpCache = found;
+                return found;
+            }
+        }
+        return null;
     }
 
     function getMyId() {
@@ -52,46 +82,69 @@
         return undefined;
     }
 
+    function statusOf(e) {
+        return e && typeof e.status === "number" ? e.status : 0;
+    }
+
     // 속도 제한(429)일 때 디스코드가 알려준 시간만큼 기다리기
     function waitTime(e) {
         var sec = e && e.body && e.body.retry_after;
         return (typeof sec === "number" ? sec * 1000 : 3000) + 300;
     }
 
-    function fetchPage(rest, channelId, before, tries) {
-        var query = { limit: 100 };
-        if (before) query.before = before;
-        return rest.get({ url: "/channels/" + channelId + "/messages", query: query }).then(
-            function (res) { return (res && res.body) || []; },
-            function (e) {
-                if (e && e.status === 429 && tries < 5) {
-                    return sleep(waitTime(e)).then(function () {
-                        return fetchPage(rest, channelId, before, tries + 1);
-                    });
-                }
-                throw e;
-            }
-        );
+    function describe(e) {
+        var s = statusOf(e);
+        var msg = (e && e.body && e.body.message) || (e && e.message) || "";
+        if (s === 403) return "권한이 없어요 (403)";
+        if (s === 401) return "로그인 정보가 만료됐어요 (401). 앱을 다시 열어 주세요";
+        if (!s) return "네트워크 오류 — 인터넷 연결을 확인하고, 청소 중에는 앱을 켜 둔 채로 있어 주세요" + (msg ? "\n(" + String(msg).split("\n")[0] + ")" : "");
+        return "HTTP " + s + (msg ? " — " + msg : "");
     }
 
-    function deleteOne(rest, channelId, messageId, tries) {
-        return rest.del({ url: "/channels/" + channelId + "/messages/" + messageId }).then(
-            function () { return "ok"; },
+    // 요청 하나: 429는 기다렸다가, 네트워크 오류는 잠깐 쉬었다가 다시 시도
+    function request(method, opts, tries) {
+        tries = tries || 0;
+        var http = findHttp();
+        var p;
+        try {
+            p = http[method](opts);
+        } catch (e) {
+            return Promise.reject(e);
+        }
+        return Promise.resolve(p).then(null, function (e) {
+            var s = statusOf(e);
+            if (s === 429 && tries < 6) {
+                return sleep(waitTime(e)).then(function () { return request(method, opts, tries + 1); });
+            }
+            if ((s === 0 || s >= 500) && tries < NET_RETRIES) {
+                return sleep(2000 * (tries + 1)).then(function () { return request(method, opts, tries + 1); });
+            }
+            throw e;
+        });
+    }
+
+    function fetchPage(channelId, before) {
+        var query = { limit: 100 };
+        if (before) query.before = before;
+        return request("get", { url: "/channels/" + channelId + "/messages", query: query, oldFormErrors: true })
+            .then(function (res) {
+                var body = res && res.body !== undefined ? res.body : res;
+                return Array.isArray(body) ? body : [];
+            });
+    }
+
+    function deleteOne(channelId, messageId) {
+        return request("del", { url: "/channels/" + channelId + "/messages/" + messageId, oldFormErrors: true }).then(
+            function () { return { ok: true }; },
             function (e) {
-                var status = e && e.status;
-                if (status === 429 && tries < 5) {
-                    return sleep(waitTime(e)).then(function () {
-                        return deleteOne(rest, channelId, messageId, tries + 1);
-                    });
-                }
-                if (status === 404) return "gone"; // 이미 지워짐
-                return "fail";
+                if (statusOf(e) === 404) return { ok: true }; // 이미 지워짐
+                return { ok: false, error: e };
             }
         );
     }
 
     // 지울 메시지 ID 모으기 (최신 → 과거 순)
-    function collect(rest, state) {
+    function collect(state) {
         var ids = [];
         var scanned = 0;
         var before = null;
@@ -100,7 +153,7 @@
             if (state.cancelled || ids.length >= state.count || scanned >= SCAN_LIMIT) {
                 return Promise.resolve(ids);
             }
-            return fetchPage(rest, state.channelId, before, 0).then(function (msgs) {
+            return fetchPage(state.channelId, before).then(function (msgs) {
                 if (!msgs.length) return ids;
                 for (var i = 0; i < msgs.length && ids.length < state.count; i++) {
                     var m = msgs[i];
@@ -115,25 +168,33 @@
                 before = msgs[msgs.length - 1].id;
                 if (msgs.length < 100) return ids; // 채널 끝까지 봄
                 return sleep(FETCH_DELAY).then(next);
+            }, function (e) {
+                // 이미 찾은 게 있으면 그것까지만 지우고, 하나도 없으면 오류로 알려요
+                if (ids.length) {
+                    state.collectWarning = describe(e);
+                    return ids;
+                }
+                e.step = "메시지 목록 불러오기";
+                throw e;
             });
         }
         return next();
     }
 
     // 하나씩 천천히 삭제 (일반 계정은 대량 삭제 API를 쓸 수 없어요)
-    function purge(rest, state, ids) {
-        var i = 0, ok = 0, fail = 0, failStreak = 0;
+    function purge(state, ids) {
+        var i = 0, ok = 0, fail = 0, failStreak = 0, lastError = null;
+
+        function done(stopped) {
+            return Promise.resolve({ ok: ok, fail: fail, stoppedByFails: stopped, lastError: lastError });
+        }
 
         function next() {
-            if (state.cancelled || i >= ids.length) {
-                return Promise.resolve({ ok: ok, fail: fail, stoppedByFails: false });
-            }
-            if (failStreak >= STOP_AFTER_FAILS) {
-                return Promise.resolve({ ok: ok, fail: fail, stoppedByFails: true });
-            }
+            if (state.cancelled || i >= ids.length) return done(false);
+            if (failStreak >= STOP_AFTER_FAILS) return done(true);
             var id = ids[i++];
-            return deleteOne(rest, state.channelId, id, 0).then(function (r) {
-                if (r === "fail") { fail++; failStreak++; } else { ok++; failStreak = 0; }
+            return deleteOne(state.channelId, id).then(function (r) {
+                if (r.ok) { ok++; failStreak = 0; } else { fail++; failStreak++; lastError = r.error; }
                 if (i % 50 === 0 && i < ids.length) toast("🧹 메세지청소 " + i + " / " + ids.length);
                 return sleep(DELETE_DELAY).then(next);
             });
@@ -142,12 +203,11 @@
     }
 
     function startJob(channelId, count, includeOthers) {
-        var rest = getRest();
-        var myId = getMyId();
-        if (!rest || typeof rest.get !== "function" || typeof rest.del !== "function") {
-            notify(channelId, "❌ 디스코드 요청 모듈을 찾지 못했어요. 디스코드나 엔드코드 업데이트로 바뀐 것 같아요.");
+        if (!findHttp()) {
+            notify(channelId, "❌ 디스코드 API 요청 모듈을 찾지 못했어요. 디스코드 업데이트로 구조가 바뀐 것 같아요.");
             return;
         }
+        var myId = getMyId();
         if (!myId) {
             notify(channelId, "❌ 내 계정 정보를 불러오지 못했어요. 앱을 다시 열고 시도해 주세요.");
             return;
@@ -157,30 +217,31 @@
         job = state;
         notify(channelId, "🔍 지울 메시지를 찾는 중이에요... (멈추기: /청소중지)");
 
-        collect(rest, state).then(function (ids) {
+        collect(state).then(function (ids) {
             if (state.cancelled) return { ok: 0, fail: 0, stoppedByFails: false };
             if (!ids.length) {
                 notify(channelId, "🤔 지울 메시지를 찾지 못했어요.");
                 return null;
             }
             var minutes = Math.max(1, Math.ceil(ids.length * (DELETE_DELAY + 200) / 60000));
-            notify(channelId, "🧹 " + ids.length + "개 삭제를 시작해요! 예상 약 " + minutes + "분 (멈추기: /청소중지)");
-            return purge(rest, state, ids);
+            var head = "🧹 " + ids.length + "개 삭제를 시작해요! 예상 약 " + minutes + "분 (멈추기: /청소중지)";
+            if (state.collectWarning) head += "\n⚠️ 목록을 끝까지 못 불러와서 찾은 만큼만 지워요: " + state.collectWarning;
+            notify(channelId, head);
+            return purge(state, ids);
         }).then(function (result) {
             if (!result) return;
             var title = state.cancelled ? "⏹️ 청소를 멈췄어요"
                 : result.stoppedByFails ? "⚠️ 청소를 중단했어요" : "✅ 청소 완료";
-            var text = title +
-                " — 삭제 " + result.ok + "개" + (result.fail ? ", 실패 " + result.fail + "개" : "");
-            if (result.stoppedByFails) {
-                text += "\n⚠️ 연속으로 실패해서 멈췄어요. 다른 사람 메시지를 지우려면 '메시지 관리' 권한이 필요해요.";
+            var text = title + " — 삭제 " + result.ok + "개" + (result.fail ? ", 실패 " + result.fail + "개" : "");
+            if (result.lastError) {
+                text += "\n마지막 실패 이유: " + describe(result.lastError);
+                if (statusOf(result.lastError) === 403 && state.includeOthers) {
+                    text += "\n(다른 사람 메시지를 지우려면 '메시지 관리' 권한이 필요해요)";
+                }
             }
             notify(channelId, text);
         }).catch(function (e) {
-            var status = e && e.status;
-            var reason = status === 403 ? "이 채널의 메시지 기록을 볼 권한이 없어요."
-                : (e && e.message) || (status ? "HTTP " + status : String(e));
-            notify(channelId, "❌ 오류가 났어요: " + reason);
+            notify(channelId, "❌ 오류가 났어요" + (e && e.step ? " (" + e.step + ")" : "") + ": " + describe(e));
         }).then(function () {
             if (job === state) job = null;
         });
@@ -280,6 +341,7 @@
         onUnload: function () {
             if (job) job.cancelled = true;
             job = null;
+            httpCache = null;
             for (var i = 0; i < unregisters.length; i++) {
                 try { unregisters[i](); } catch (e) { /* 무시 */ }
             }
